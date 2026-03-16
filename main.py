@@ -66,7 +66,9 @@ def check_and_queue_migrations(data: list, media_type: str):
         return
         
     for obj in data:
-        profile_id = obj.get("language_profile_id")
+        # Check all possible keys Bazarr uses for the profile ID
+        profile_id = obj.get("language_profile_id") or obj.get("profile_id") or obj.get("profileId")
+        
         if profile_id == source_profile_id:
             missing = obj.get("missing_subtitles", [])
             # If the specific language 'no' is missing, queue migration
@@ -78,6 +80,7 @@ def check_and_queue_migrations(data: list, media_type: str):
                     video_id = obj.get("radarr_id") if media_type == "movies" else obj.get("sonarr_episode_id")
                     
                 if video_id and not migration_queue.check({"type": media_type, "id": video_id, "target_profile": target_profile_id}):
+                    logger.info(f"Queued Profile Migration for {media_type} ID: {video_id}")
                     migration_queue.put({"type": media_type, "id": video_id, "target_profile": target_profile_id})
 
 async def get_episodes_metadata(base_url: str, api_key: str, episode_ids: Optional[List[int]] = None) -> List[Serie] | None:
@@ -295,16 +298,18 @@ def search_worker(worker_id, base_url, api_key):
                 get_response.raise_for_status()
                 data = get_response.json().get("data", [])
                 
+                # Fixed the provider name to "embedded"
                 candidates = [
                     c for c in data 
-                    if c.get("language") in base_languages and c.get("provider") in ["embedded_subtitles", "whisperai"]
+                    if c.get("language") in base_languages and c.get("provider") in ["embedded", "whisperai"]
                 ]
                 
                 if not candidates:
                     logger.info(f"[Search Worker: {worker_id}] No embedded or Whisper candidates found for ID: {video_id}")
                     continue
                     
-                candidates.sort(key=lambda c: 0 if c.get("provider") == "embedded_subtitles" else 1)
+                # Fixed the provider name to "embedded"
+                candidates.sort(key=lambda c: 0 if c.get("provider") == "embedded" else 1)
                 best_sub = candidates[0]
                 
                 logger.info(f"[Search Worker: {worker_id}] Found {best_sub['provider']} candidate. Triggering download/extraction...")
