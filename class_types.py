@@ -2,9 +2,10 @@ from typing import Any, List, TypeVar, Callable, Type, cast, Optional
 
 T = TypeVar("T")
 
-def from_str(x: Any) -> str:
-    assert isinstance(x, str)
-    return x
+def from_str(x):
+    if x is None:
+        return None
+    return str(x)
 
 def from_bool(x: Any) -> bool:
     assert isinstance(x, bool)
