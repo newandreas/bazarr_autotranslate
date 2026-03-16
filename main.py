@@ -313,10 +313,17 @@ if __name__ == "__main__":
         print("BAZARR_BASE_URL or BAZARR_API_KEY missing")
         sys.exit(1)
 
+    # 1. Setup File Logging
     os.makedirs(log_directory, exist_ok=True)
-    handler = TimedRotatingFileHandler(os.path.join(log_directory, "bazarr_lingarr_autotranslate.log"), when="midnight", interval=1, backupCount=4)
-    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-    logger.addHandler(handler)
+    file_handler = TimedRotatingFileHandler(os.path.join(log_directory, "bazarr_lingarr_autotranslate.log"), when="midnight", interval=1, backupCount=4)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(file_handler)
+
+    # 2. Setup Console Logging (FOR DOCKER)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(console_handler)
+
     logger.setLevel(logging.INFO if log_level.lower() == "info" else logging.DEBUG)
 
     loop = asyncio.new_event_loop()
