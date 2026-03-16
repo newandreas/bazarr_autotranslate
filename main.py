@@ -52,7 +52,7 @@ ACTION_COOLDOWN_SECONDS = 3600
 
 key_fn = lambda x: f" {"s" if get_attr_or_key(x, "is_serie") else "m"} {get_attr_or_key(x, "video_id")}_{get_attr_or_key(x, "to_language")}"
 search_key_fn = lambda x: f"search_{'s' if get_attr_or_key(x, 'is_serie') else 'm'}_{get_attr_or_key(x, 'video_id')}"
-migration_key_fn = lambda x: f"mig_{x['type']}_{x['id']}"
+migration_key_fn = lambda x: f"mig_{x['type']}_{x['mig_id']}"
 
 task_queue = UniqueQueue(key_fn=key_fn)
 search_task_queue = UniqueQueue(key_fn=search_key_fn)
@@ -60,28 +60,69 @@ migration_queue = UniqueQueue(key_fn=migration_key_fn)
 shutdown_event = asyncio.Event()
 logger = logging.getLogger("bazarr_lingarr")
 
-def check_and_queue_migrations(data: list, media_type: str):
-    """Intercepts raw JSON data to check if profiles need to be migrated to NB"""
+async def process_profile_migrations(base_url, api_key, media_type):
+    """Independently checks for media missing 'no' and migrates their profile to 'nb'"""
     if not source_profile_id or not target_profile_id:
         return
         
-    for obj in data:
-        # Check all possible keys Bazarr uses for the profile ID
-        profile_id = obj.get("language_profile_id") or obj.get("profile_id") or obj.get("profileId")
+    endpoint = f"{base_url}/api/{media_type}/wanted"
+    headers = {"X-API-KEY": api_key}
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(endpoint, headers=headers, params={"start": 0, "length": -1})
+            resp.raise_for_status()
+            wanted_data = resp.json().get("data", [])
+    except Exception as e:
+        logger.error(f"Migration check failed to get wanted {media_type}: {e}")
+        return
         
-        if profile_id == source_profile_id:
-            missing = obj.get("missing_subtitles", [])
-            # If the specific language 'no' is missing, queue migration
-            if any(isinstance(sub, dict) and sub.get("code2") == "no" for sub in missing):
-                video_id = obj.get("radarrId") if media_type == "movies" else obj.get("sonarrEpisodeId")
+    candidates = []
+    for obj in wanted_data:
+        missing = obj.get("missing_subtitles", [])
+        # Only check items specifically missing "no"
+        if any(isinstance(sub, dict) and sub.get("code2") == "no" for sub in missing):
+            vid_id = obj.get("radarrId") if media_type == "movies" else obj.get("sonarrEpisodeId")
+            series_id = obj.get("sonarrSeriesId") if media_type == "episodes" else None
+            if vid_id:
+                candidates.append({"vid_id": vid_id, "series_id": series_id})
                 
-                # Fallback if raw keys differ
-                if not video_id:
-                    video_id = obj.get("radarr_id") if media_type == "movies" else obj.get("sonarr_episode_id")
+    if not candidates:
+        return
+        
+    # Fetch full metadata to check the actual profile ID
+    meta_endpoint = f"{base_url}/api/{media_type}"
+    async with httpx.AsyncClient() as client:
+        chunk_size = 50
+        for i in range(0, len(candidates), chunk_size):
+            chunk = candidates[i:i+chunk_size]
+            vid_ids = [c["vid_id"] for c in chunk]
+            params = {"radarrid[]" if media_type == "movies" else "episodeid[]": vid_ids}
+            
+            try:
+                meta_resp = await client.get(meta_endpoint, headers=headers, params=params)
+                meta_resp.raise_for_status()
+                for raw_item in meta_resp.json().get("data", []):
+                    prof_id = raw_item.get("language_profile_id") or raw_item.get("profile_id") or raw_item.get("profileId")
                     
-                if video_id and not migration_queue.check({"type": media_type, "id": video_id, "target_profile": target_profile_id}):
-                    logger.info(f"Queued Profile Migration for {media_type} ID: {video_id}")
-                    migration_queue.put({"type": media_type, "id": video_id, "target_profile": target_profile_id})
+                    if prof_id == source_profile_id:
+                        v_id = raw_item.get("radarrId") if media_type == "movies" else raw_item.get("sonarrEpisodeId")
+                        c = next((x for x in chunk if x["vid_id"] == v_id), None)
+                        if c:
+                            # Apply to the Movie directly, or the parent Series for episodes
+                            mig_id = v_id if media_type == "movies" else c["series_id"]
+                            if media_type == "episodes" and not mig_id:
+                                mig_id = raw_item.get("sonarrSeriesId") or raw_item.get("seriesId")
+                            
+                            if mig_id and not migration_queue.check({"type": media_type, "mig_id": mig_id}):
+                                logger.info(f"Queued Profile Migration for {media_type} (Target ID: {mig_id})")
+                                migration_queue.put({
+                                    "type": media_type,
+                                    "mig_id": mig_id,
+                                    "target_profile": target_profile_id
+                                })
+            except Exception as e:
+                logger.error(f"Migration metadata fetch failed: {e}")
 
 async def get_episodes_metadata(base_url: str, api_key: str, episode_ids: Optional[List[int]] = None) -> List[Serie] | None:
     endpoint = f"{base_url}/api/episodes"
@@ -114,9 +155,7 @@ async def get_wanted_episodes(base_url: str, api_key: str) -> List[Serie] | None
         async with httpx.AsyncClient() as client:
             response = await client.get(endpoint, headers=headers, params={"start": 0, "length": -1})
             response.raise_for_status()
-            data = response.json()["data"]
-            check_and_queue_migrations(data, "episodes")
-            return [Serie.from_dict(obj) for obj in data]
+            return [Serie.from_dict(obj) for obj in response.json()["data"]]
     except Exception:
         logger.exception("Error while getting wanted episodes:")
         return None
@@ -152,9 +191,7 @@ async def get_wanted_movies(base_url: str, api_key: str) -> List[Movie] | None:
         async with httpx.AsyncClient() as client:
             response = await client.get(endpoint, headers=headers, params={"start": 0, "length": -1})
             response.raise_for_status()
-            data = response.json()["data"]
-            check_and_queue_migrations(data, "movies")
-            return [Movie.from_dict(obj) for obj in data]
+            return [Movie.from_dict(obj) for obj in response.json()["data"]]
     except Exception:
         logger.exception("Error while getting wanted movies:")
         return None
@@ -227,16 +264,20 @@ def migration_worker(worker_id, base_url, api_key):
             try:
                 item = migration_queue.get()
                 media_type = item["type"]
-                video_id = item["id"]
+                mig_id = item["mig_id"]
                 target_profile = item["target_profile"]
                 
-                logger.info(f"[Migration Worker: {worker_id}] Changing {media_type} ID {video_id} to Profile {target_profile}")
+                # API expects POST with radarrid[] and profileid[] arrays
+                if media_type == "movies":
+                    endpoint = f"{base_url}/api/movies"
+                    params = {"radarrid[]": [mig_id], "profileid[]": [str(target_profile)]}
+                else:
+                    endpoint = f"{base_url}/api/series"
+                    params = {"seriesid[]": [mig_id], "profileid[]": [str(target_profile)]}
+                    
+                logger.info(f"[Migration Worker: {worker_id}] Changing profile for {media_type} ID {mig_id} to Profile {target_profile}")
                 
-                endpoint = f"{base_url}/api/{media_type}"
-                params = {"radarrid[]": video_id} if media_type == "movies" else {"episodeid[]": video_id}
-                payload = {"language_profile_id": target_profile}
-
-                response = client.patch(endpoint, headers=headers, params=params, json=payload)
+                response = client.post(endpoint, headers=headers, params=params)
                 response.raise_for_status()
                 logger.info(f"[Migration Worker: {worker_id}] Profile changed successfully!")
 
@@ -298,6 +339,7 @@ def search_worker(worker_id, base_url, api_key):
                 get_response.raise_for_status()
                 data = get_response.json().get("data", [])
                 
+                # Accurately mapping to embeddedsubtitles based on your API response
                 candidates = [
                     c for c in data 
                     if c.get("language") in base_languages and c.get("provider") in ["embeddedsubtitles", "whisperai"]
@@ -308,9 +350,6 @@ def search_worker(worker_id, base_url, api_key):
                     continue
                     
                 candidates.sort(key=lambda c: 0 if c.get("provider") == "embeddedsubtitles" else 1)
-                    
-                # Fixed the provider name to "embedded"
-                candidates.sort(key=lambda c: 0 if c.get("provider") == "embedded" else 1)
                 best_sub = candidates[0]
                 
                 logger.info(f"[Search Worker: {worker_id}] Found {best_sub['provider']} candidate. Triggering download/extraction...")
@@ -350,6 +389,11 @@ def search_worker(worker_id, base_url, api_key):
 
 async def scan_and_process(base_url, api_key, media_type="episodes"):
     logger.info(f"Scanning for {media_type}")
+    
+    # 1. Run profile migrations separately
+    await process_profile_migrations(base_url, api_key, media_type)
+    
+    # 2. Run subtitle extraction/translation
     if media_type == "episodes":
         items = await get_wanted_episodes(base_url, api_key)
     else:
