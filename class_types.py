@@ -10,9 +10,29 @@ def from_bool(x: Any) -> bool:
     assert isinstance(x, bool)
     return x
 
-def from_list(f: Callable[[Any], T], x: Any) -> List[T]:
-    assert isinstance(x, list)
-    return [f(y) for y in x]
+def from_list(f, x):
+    if not isinstance(x, list):
+        return []
+    res = []
+    for y in x:
+        try:
+            res.append(f(y))
+        except Exception as e:
+            # If one subtitle has a weird data type, skip it instead of crashing the whole episode
+            import logging
+            logging.getLogger("bazarr_lingarr").debug(f"Skipped parsing a list item due to strict typing. Error: {e}")
+    return res
+
+def from_union(fs, x):
+    for f in fs:
+        try:
+            return f(x)
+        except Exception:
+            pass
+    # Instead of crashing with 'assert False', just return None and move on
+    import logging
+    logging.getLogger("bazarr_lingarr").warning(f"Type assertion failed for data. Returning None. Data: {x}")
+    return None
 
 def from_int(x: Any) -> int:
     assert isinstance(x, int) and not isinstance(x, bool)
@@ -22,13 +42,6 @@ def from_none(x: Any) -> Any:
     assert x is None
     return x
 
-def from_union(fs, x):
-    for f in fs:
-        try:
-            return f(x)
-        except:
-            pass
-    assert False
 
 def to_class(c: Type[T], x: Any) -> dict:
     assert isinstance(x, c)
