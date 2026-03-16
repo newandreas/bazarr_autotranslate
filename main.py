@@ -1,21 +1,17 @@
 import os
 import sys
+import time
 import httpx
 import queue
 import signal
 import asyncio
 import logging
 import threading
-import time
 from dotenv import load_dotenv
 from typing import List, Optional
 from unique_queue import UniqueQueue
 from logging.handlers import TimedRotatingFileHandler
 from class_types import Serie, Movie, SubtitleTranslate
-
-# Cache to prevent spamming Bazarr for long-running tasks like WhisperAI
-action_cooldown_cache = {}
-ACTION_COOLDOWN_SECONDS = 43200 # Wait 12 hours before re-triggering the same action
 
 def get_env_or_default(env, default):
     val = os.getenv(env)
@@ -45,18 +41,48 @@ log_directory = get_env_or_default("LOG_DIRECTORY", "logs/")
 series_scan = bool(get_env_or_default("SERIES_SCAN", True))
 movies_scan = bool(get_env_or_default("MOVIES_SCAN", True))
 
+# Profile Migration Env Vars
+source_profile_id = get_env_or_default("SOURCE_PROFILE_ID", None)
+target_profile_id = get_env_or_default("TARGET_PROFILE_ID", None)
+if source_profile_id: source_profile_id = int(source_profile_id)
+if target_profile_id: target_profile_id = int(target_profile_id)
+
+action_cooldown_cache = {}
+ACTION_COOLDOWN_SECONDS = 3600
+
 key_fn = lambda x: f" {"s" if get_attr_or_key(x, "is_serie") else "m"} {get_attr_or_key(x, "video_id")}_{get_attr_or_key(x, "to_language")}"
 search_key_fn = lambda x: f"search_{'s' if get_attr_or_key(x, 'is_serie') else 'm'}_{get_attr_or_key(x, 'video_id')}"
+migration_key_fn = lambda x: f"mig_{x['type']}_{x['id']}"
 
 task_queue = UniqueQueue(key_fn=key_fn)
 search_task_queue = UniqueQueue(key_fn=search_key_fn)
+migration_queue = UniqueQueue(key_fn=migration_key_fn)
 shutdown_event = asyncio.Event()
 logger = logging.getLogger("bazarr_lingarr")
+
+def check_and_queue_migrations(data: list, media_type: str):
+    """Intercepts raw JSON data to check if profiles need to be migrated to NB"""
+    if not source_profile_id or not target_profile_id:
+        return
+        
+    for obj in data:
+        profile_id = obj.get("language_profile_id")
+        if profile_id == source_profile_id:
+            missing = obj.get("missing_subtitles", [])
+            # If the specific language 'no' is missing, queue migration
+            if any(isinstance(sub, dict) and sub.get("code2") == "no" for sub in missing):
+                video_id = obj.get("radarrId") if media_type == "movies" else obj.get("sonarrEpisodeId")
+                
+                # Fallback if raw keys differ
+                if not video_id:
+                    video_id = obj.get("radarr_id") if media_type == "movies" else obj.get("sonarr_episode_id")
+                    
+                if video_id and not migration_queue.check({"type": media_type, "id": video_id, "target_profile": target_profile_id}):
+                    migration_queue.put({"type": media_type, "id": video_id, "target_profile": target_profile_id})
 
 async def get_episodes_metadata(base_url: str, api_key: str, episode_ids: Optional[List[int]] = None) -> List[Serie] | None:
     endpoint = f"{base_url}/api/episodes"
     headers = {"X-API-KEY": api_key}
-
     try:
         async with httpx.AsyncClient() as client:
             if not episode_ids:
@@ -64,7 +90,6 @@ async def get_episodes_metadata(base_url: str, api_key: str, episode_ids: Option
                 response.raise_for_status()
                 return [Serie.from_dict(obj) for obj in response.json()["data"]]
             
-            # CHUNKING: Send max 50 IDs at a time to prevent "414 URI Too Long" errors
             all_episodes = []
             chunk_size = 50
             for i in range(0, len(episode_ids), chunk_size):
@@ -86,7 +111,9 @@ async def get_wanted_episodes(base_url: str, api_key: str) -> List[Serie] | None
         async with httpx.AsyncClient() as client:
             response = await client.get(endpoint, headers=headers, params={"start": 0, "length": -1})
             response.raise_for_status()
-            return [Serie.from_dict(obj) for obj in response.json()["data"]]
+            data = response.json()["data"]
+            check_and_queue_migrations(data, "episodes")
+            return [Serie.from_dict(obj) for obj in data]
     except Exception:
         logger.exception("Error while getting wanted episodes:")
         return None
@@ -94,7 +121,6 @@ async def get_wanted_episodes(base_url: str, api_key: str) -> List[Serie] | None
 async def get_movies_metadata(base_url: str, api_key: str, movie_ids: Optional[List[int]] = None) -> List[Movie] | None:
     endpoint = f"{base_url}/api/movies"
     headers = {"X-API-KEY": api_key}
-
     try:
         async with httpx.AsyncClient() as client:
             if not movie_ids:
@@ -102,7 +128,6 @@ async def get_movies_metadata(base_url: str, api_key: str, movie_ids: Optional[L
                 response.raise_for_status()
                 return [Movie.from_dict(obj) for obj in response.json()["data"]]
             
-            # CHUNKING: Send max 50 IDs at a time to prevent "414 URI Too Long" errors
             all_movies = []
             chunk_size = 50
             for i in range(0, len(movie_ids), chunk_size):
@@ -124,13 +149,14 @@ async def get_wanted_movies(base_url: str, api_key: str) -> List[Movie] | None:
         async with httpx.AsyncClient() as client:
             response = await client.get(endpoint, headers=headers, params={"start": 0, "length": -1})
             response.raise_for_status()
-            return [Movie.from_dict(obj) for obj in response.json()["data"]]
+            data = response.json()["data"]
+            check_and_queue_migrations(data, "movies")
+            return [Movie.from_dict(obj) for obj in data]
     except Exception:
         logger.exception("Error while getting wanted movies:")
         return None
 
 def is_external_subtitle(sub, video_path) -> bool:
-    """Helper to detect if a subtitle is external (not embedded inside the video file)"""
     if not sub.path:
         return False
     if video_path and sub.path == video_path:
@@ -165,7 +191,6 @@ async def find_base_language_subtitles_from_missing_sutitles(base_url, api_key, 
     items_to_search = []
 
     for video_id, language in video_id_language_map.items():
-        # Handle cases where the metadata chunking missed a video somehow
         video = video_id_to_video_map.get(video_id)
         if not video:
             continue
@@ -177,12 +202,9 @@ async def find_base_language_subtitles_from_missing_sutitles(base_url, api_key, 
         external_base_subs = [sub for sub in base_subs if is_external_subtitle(sub, getattr(video, 'path', None))]
 
         if external_base_subs:
-            # External Base Subtitle Exists -> Queue for Translation!
             if not task_queue.check({"is_serie": isinstance(video, Serie), "video_id": video_id, "to_language": language}):
                 subtitles_to_translate.append(SubtitleTranslate(external_base_subs[0], language, video_id, isinstance(video, Serie)))
         else:
-            # We need to manually query Providers to Extract or Transcribe
-            # Bazarr requires `seriesid` when POSTing for an episode, so we retrieve it here
             series_id = getattr(video, 'sonarr_series_id', None) or getattr(video, 'series_id', None) if isinstance(video, Serie) else None
             
             if not search_task_queue.check({"is_serie": isinstance(video, Serie), "video_id": video_id}):
@@ -193,6 +215,32 @@ async def find_base_language_subtitles_from_missing_sutitles(base_url, api_key, 
                 })
 
     return subtitles_to_translate, items_to_search
+
+def migration_worker(worker_id, base_url, api_key):
+    headers = {"X-API-KEY": api_key}
+    with httpx.Client(timeout=15) as client:
+        while True:
+            item = None
+            try:
+                item = migration_queue.get()
+                media_type = item["type"]
+                video_id = item["id"]
+                target_profile = item["target_profile"]
+                
+                logger.info(f"[Migration Worker: {worker_id}] Changing {media_type} ID {video_id} to Profile {target_profile}")
+                
+                endpoint = f"{base_url}/api/{media_type}"
+                params = {"radarrid[]": video_id} if media_type == "movies" else {"episodeid[]": video_id}
+                payload = {"language_profile_id": target_profile}
+
+                response = client.patch(endpoint, headers=headers, params=params, json=payload)
+                response.raise_for_status()
+                logger.info(f"[Migration Worker: {worker_id}] Profile changed successfully!")
+
+            except Exception:
+                logger.exception(f"[Migration Worker: {worker_id}] Error in profile migration:")
+            finally:
+                if item: migration_queue.done(item)
 
 def translation_worker(worker_id, base_url, api_key):
     endpoint = f"{base_url}/api/subtitles"
@@ -225,7 +273,6 @@ def translation_worker(worker_id, base_url, api_key):
 
 def search_worker(worker_id, base_url, api_key):
     headers = {"X-API-KEY": api_key}
-    # Increased timeout since Whisper transcription can take a while
     with httpx.Client(timeout=translation_request_timeout) as client:
         while True:
             item = None
@@ -237,7 +284,6 @@ def search_worker(worker_id, base_url, api_key):
                 
                 logger.info(f"[Search Worker: {worker_id}] Querying Providers for {'Episode' if is_serie else 'Movie'} ID: {video_id}")
                 
-                # STEP 1: GET candidates from providers
                 if is_serie:
                     get_endpoint = f"{base_url}/api/providers/episodes"
                     get_params = {"episodeid": video_id}
@@ -249,7 +295,6 @@ def search_worker(worker_id, base_url, api_key):
                 get_response.raise_for_status()
                 data = get_response.json().get("data", [])
                 
-                # Filter candidates: Must be in our base_languages AND come from extraction/transcription providers
                 candidates = [
                     c for c in data 
                     if c.get("language") in base_languages and c.get("provider") in ["embedded_subtitles", "whisperai"]
@@ -259,13 +304,11 @@ def search_worker(worker_id, base_url, api_key):
                     logger.info(f"[Search Worker: {worker_id}] No embedded or Whisper candidates found for ID: {video_id}")
                     continue
                     
-                # Prioritize 'embedded_subtitles' over 'whisperai' since extraction is instant and accurate
                 candidates.sort(key=lambda c: 0 if c.get("provider") == "embedded_subtitles" else 1)
                 best_sub = candidates[0]
                 
                 logger.info(f"[Search Worker: {worker_id}] Found {best_sub['provider']} candidate. Triggering download/extraction...")
                 
-                # STEP 2: POST the chosen candidate to trigger the download/extract
                 if is_serie:
                     post_endpoint = f"{base_url}/api/providers/episodes"
                     post_params = {
@@ -278,7 +321,6 @@ def search_worker(worker_id, base_url, api_key):
                         "radarrid": video_id,
                     }
                     
-                # Convert string 'True'/'False' from the API to lowercase booleans for the request
                 hi_flag = "true" if str(best_sub.get("hearing_impaired", "False")).lower() == "true" else "false"
                 forced_flag = "true" if str(best_sub.get("forced", "False")).lower() == "true" else "false"
 
@@ -287,7 +329,7 @@ def search_worker(worker_id, base_url, api_key):
                     "forced": forced_flag,
                     "original_format": "true",
                     "provider": best_sub.get("provider"),
-                    "subtitle": best_sub.get("subtitle") # Httpx automatically URL encodes this large pickled string
+                    "subtitle": best_sub.get("subtitle")
                 })
 
                 post_response = client.post(post_endpoint, headers=headers, params=post_params)
@@ -328,12 +370,12 @@ async def scan_and_process(base_url, api_key, media_type="episodes"):
             action_cooldown_cache[cache_key] = current_time
             search_task_queue.put(item)
             logger.info(f"Queued Extract/Whisper check: {'Episode' if item['is_serie'] else 'Movie'} ID {item['video_id']}")
-            
+
 async def main(base_url, api_key):
-    # Spin up workers
     for i in range(num_workers):
         threading.Thread(target=translation_worker, args=(i, base_url, api_key), daemon=True).start()
         threading.Thread(target=search_worker, args=(i, base_url, api_key), daemon=True).start()
+        threading.Thread(target=migration_worker, args=(i, base_url, api_key), daemon=True).start()
     
     while not shutdown_event.is_set():
         try:
@@ -361,7 +403,6 @@ if __name__ == "__main__":
     file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
     logger.addHandler(file_handler)
 
-    # Added console handler back in so logs output directly in Docker
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
     logger.addHandler(console_handler)
