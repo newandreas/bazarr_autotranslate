@@ -6,11 +6,16 @@ import signal
 import asyncio
 import logging
 import threading
+import time
 from dotenv import load_dotenv
 from typing import List, Optional
 from unique_queue import UniqueQueue
 from logging.handlers import TimedRotatingFileHandler
 from class_types import Serie, Movie, SubtitleTranslate
+
+# Cache to prevent spamming Bazarr for long-running tasks like WhisperAI
+action_cooldown_cache = {}
+ACTION_COOLDOWN_SECONDS = 43200 # Wait 12 hours before re-triggering the same action
 
 def get_env_or_default(env, default):
     val = os.getenv(env)
@@ -308,14 +313,22 @@ async def scan_and_process(base_url, api_key, media_type="episodes"):
     
     subs_to_translate, items_to_search = await find_base_language_subtitles_from_missing_sutitles(base_url, api_key, items)
     
+    current_time = time.time()
+    
     for sub in subs_to_translate:
-        task_queue.put(sub)
-        logger.info(f"Queued Translate: {sub.base_subtitle.path} -> {sub.to_language}")
+        cache_key = f"trans_{sub.video_id}"
+        if current_time - action_cooldown_cache.get(cache_key, 0) > ACTION_COOLDOWN_SECONDS:
+            action_cooldown_cache[cache_key] = current_time
+            task_queue.put(sub)
+            logger.info(f"Queued Translate: {sub.base_subtitle.path} -> {sub.to_language}")
 
     for item in items_to_search:
-        search_task_queue.put(item)
-        logger.info(f"Queued Extract/Whisper check: {'Episode' if item['is_serie'] else 'Movie'} ID {item['video_id']}")
-
+        cache_key = f"search_{item['video_id']}"
+        if current_time - action_cooldown_cache.get(cache_key, 0) > ACTION_COOLDOWN_SECONDS:
+            action_cooldown_cache[cache_key] = current_time
+            search_task_queue.put(item)
+            logger.info(f"Queued Extract/Whisper check: {'Episode' if item['is_serie'] else 'Movie'} ID {item['video_id']}")
+            
 async def main(base_url, api_key):
     # Spin up workers
     for i in range(num_workers):
