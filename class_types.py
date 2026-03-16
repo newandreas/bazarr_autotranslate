@@ -36,8 +36,12 @@ def from_union(fs, x):
     return None
 
 def from_int(x: Any) -> int:
-    assert isinstance(x, int) and not isinstance(x, bool)
-    return x
+    if x is None:
+        return 0
+    try:
+        return int(x)
+    except:
+        return 0
 
 def from_none(x: Any) -> Any:
     assert x is None
