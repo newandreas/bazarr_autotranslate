@@ -97,9 +97,9 @@ class Subtitle:
     path: str
     forced: bool
     hi: bool
-    file_size: int
+    file_size: Optional[int]
 
-    def __init__(self, name: str, code2: str, code3: str, path: str, forced: bool, hi: bool, file_size: int) -> None:
+    def __init__(self, name: str, code2: str, code3: str, path: str, forced: bool, hi: bool, file_size: Optional[int]) -> None:
         self.name = name
         self.code2 = code2
         self.code3 = code3
@@ -117,7 +117,7 @@ class Subtitle:
         path = from_str(obj.get("path"))
         forced = from_bool(obj.get("forced"))
         hi = from_bool(obj.get("hi"))
-        file_size = from_int(obj.get("file_size"))
+        file_size = from_union([from_int, from_none], obj.get("file_size"))
         return Subtitle(name, code2, code3, path, forced, hi, file_size)
 
     def to_dict(self) -> dict:
@@ -128,9 +128,9 @@ class Subtitle:
         result["path"] = from_str(self.path)
         result["forced"] = from_bool(self.forced)
         result["hi"] = from_bool(self.hi)
-        result["file_size"] = from_int(self.file_size)
+        if self.file_size is not None:
+            result["file_size"] = from_union([from_int, from_none], self.file_size)
         return result
-
 
 class Serie:
     missing_subtitles: List[MissingSubtitle]
