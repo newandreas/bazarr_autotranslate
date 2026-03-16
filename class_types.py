@@ -35,7 +35,7 @@ def from_union(fs, x):
     logging.getLogger("bazarr_lingarr").warning(f"Type assertion failed for data. Returning None. Data: {x}")
     return None
 
-def from_int(x: Any) -> int:
+def from_int(x) -> int:
     if x is None:
         return 0
     try:
