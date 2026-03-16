@@ -17,10 +17,10 @@ def from_list(f, x):
     for y in x:
         try:
             res.append(f(y))
-        except Exception as e:
-            # If one subtitle has a weird data type, skip it instead of crashing the whole episode
+        except Exception:
             import logging
-            logging.getLogger("bazarr_lingarr").debug(f"Skipped parsing a list item due to strict typing. Error: {e}")
+            # This will print the full error trace AND the raw dictionary of the subtitle it rejected
+            logging.getLogger("bazarr_lingarr").exception(f"Skipped parsing a list item due to strict typing. Item data: {y}")
     return res
 
 def from_union(fs, x):
