@@ -267,13 +267,13 @@ def migration_worker(worker_id, base_url, api_key):
                 mig_id = item["mig_id"]
                 target_profile = item["target_profile"]
                 
-                # API expects POST with radarrid[] and profileid[] arrays
+                # API expects POST with radarrid and profileid parameters
                 if media_type == "movies":
                     endpoint = f"{base_url}/api/movies"
-                    params = {"radarrid[]": [mig_id], "profileid[]": [str(target_profile)]}
+                    params = {"radarrid": mig_id, "profileid": target_profile}
                 else:
                     endpoint = f"{base_url}/api/series"
-                    params = {"seriesid[]": [mig_id], "profileid[]": [str(target_profile)]}
+                    params = {"seriesid": mig_id, "profileid": target_profile}
                     
                 logger.info(f"[Migration Worker: {worker_id}] Changing profile for {media_type} ID {mig_id} to Profile {target_profile}")
                 
