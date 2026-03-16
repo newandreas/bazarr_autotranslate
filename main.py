@@ -169,7 +169,7 @@ async def find_base_language_subtitles_from_missing_sutitles(base_url, api_key, 
             video.subtitles = []
 
         base_subs = [sub for sub in video.subtitles if sub.code2 in base_languages]
-        external_base_subs = [sub for sub in base_subs if is_external_subtitle(sub, video.path)]
+        external_base_subs = [sub for sub in base_subs if is_external_subtitle(sub, getattr(video, 'path', None))]
 
         if external_base_subs:
             # External Base Subtitle Exists -> Queue for Translation!
