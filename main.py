@@ -298,15 +298,16 @@ def search_worker(worker_id, base_url, api_key):
                 get_response.raise_for_status()
                 data = get_response.json().get("data", [])
                 
-                # Fixed the provider name to "embedded"
                 candidates = [
                     c for c in data 
-                    if c.get("language") in base_languages and c.get("provider") in ["embedded", "whisperai"]
+                    if c.get("language") in base_languages and c.get("provider") in ["embeddedsubtitles", "whisperai"]
                 ]
                 
                 if not candidates:
                     logger.info(f"[Search Worker: {worker_id}] No embedded or Whisper candidates found for ID: {video_id}")
                     continue
+                    
+                candidates.sort(key=lambda c: 0 if c.get("provider") == "embeddedsubtitles" else 1)
                     
                 # Fixed the provider name to "embedded"
                 candidates.sort(key=lambda c: 0 if c.get("provider") == "embedded" else 1)
