@@ -29,8 +29,8 @@ load_dotenv()
 base_languages_env = os.getenv("BASE_LANGUAGES")
 base_languages = [lang.strip() for lang in base_languages_env.split(",")] if base_languages_env else []
 
-to_languges_env = os.getenv("TO_LANGUAGES")
-to_languges = [lang.strip() for lang in to_languges_env.split(",")] if to_languges_env else []
+to_languages_env = os.getenv("TO_LANGUAGES")
+to_languages = [lang.strip() for lang in to_languages_env.split(",")] if to_languages_env else []
 
 translation_request_timeout = int(get_env_or_default("TRANSLATION_REQUEST_TIMEOUT", 15 * 60))
 num_workers = int(get_env_or_default("NUM_WORKERS", 1))
@@ -51,16 +51,28 @@ logger = logging.getLogger("bazarr_lingarr")
 async def get_episodes_metadata(base_url: str, api_key: str, episode_ids: Optional[List[int]] = None) -> List[Serie] | None:
     endpoint = f"{base_url}/api/episodes"
     headers = {"X-API-KEY": api_key}
-    params = {}
-    if episode_ids: params["episodeid[]"] = episode_ids
 
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.get(endpoint, headers=headers, params=params)
-            response.raise_for_status()
-            return [Serie.from_dict(obj) for obj in response.json()["data"]]
-    except Exception as e:
-        logger.error(f"Error while getting episode metadata: {e}")
+            if not episode_ids:
+                response = await client.get(endpoint, headers=headers)
+                response.raise_for_status()
+                return [Serie.from_dict(obj) for obj in response.json()["data"]]
+            
+            # CHUNKING: Send max 50 IDs at a time to prevent "414 URI Too Long" errors
+            all_episodes = []
+            chunk_size = 50
+            for i in range(0, len(episode_ids), chunk_size):
+                chunk = episode_ids[i:i + chunk_size]
+                params = {"episodeid[]": chunk}
+                response = await client.get(endpoint, headers=headers, params=params)
+                response.raise_for_status()
+                all_episodes.extend([Serie.from_dict(obj) for obj in response.json()["data"]])
+                
+            return all_episodes
+    except Exception:
+        logger.exception("Error while getting episode metadata:")
+        return None
 
 async def get_wanted_episodes(base_url: str, api_key: str) -> List[Serie] | None:
     endpoint = f"{base_url}/api/episodes/wanted"
@@ -70,22 +82,35 @@ async def get_wanted_episodes(base_url: str, api_key: str) -> List[Serie] | None
             response = await client.get(endpoint, headers=headers, params={"start": 0, "length": -1})
             response.raise_for_status()
             return [Serie.from_dict(obj) for obj in response.json()["data"]]
-    except Exception as e:
-        logger.error(f"Error while getting wanted episodes: {e}")
+    except Exception:
+        logger.exception("Error while getting wanted episodes:")
+        return None
 
 async def get_movies_metadata(base_url: str, api_key: str, movie_ids: Optional[List[int]] = None) -> List[Movie] | None:
     endpoint = f"{base_url}/api/movies"
     headers = {"X-API-KEY": api_key}
-    params = {}
-    if movie_ids: params["radarrid[]"] = movie_ids
 
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.get(endpoint, headers=headers, params=params)
-            response.raise_for_status()
-            return [Movie.from_dict(obj) for obj in response.json()["data"]]
-    except Exception as e:
-        logger.error(f"Error while getting movies metadata: {e}")
+            if not movie_ids:
+                response = await client.get(endpoint, headers=headers)
+                response.raise_for_status()
+                return [Movie.from_dict(obj) for obj in response.json()["data"]]
+            
+            # CHUNKING: Send max 50 IDs at a time to prevent "414 URI Too Long" errors
+            all_movies = []
+            chunk_size = 50
+            for i in range(0, len(movie_ids), chunk_size):
+                chunk = movie_ids[i:i + chunk_size]
+                params = {"radarrid[]": chunk}
+                response = await client.get(endpoint, headers=headers, params=params)
+                response.raise_for_status()
+                all_movies.extend([Movie.from_dict(obj) for obj in response.json()["data"]])
+                
+            return all_movies
+    except Exception:
+        logger.exception("Error while getting movies metadata:")
+        return None
 
 async def get_wanted_movies(base_url: str, api_key: str) -> List[Movie] | None:
     endpoint = f"{base_url}/api/movies/wanted"
@@ -95,8 +120,9 @@ async def get_wanted_movies(base_url: str, api_key: str) -> List[Movie] | None:
             response = await client.get(endpoint, headers=headers, params={"start": 0, "length": -1})
             response.raise_for_status()
             return [Movie.from_dict(obj) for obj in response.json()["data"]]
-    except Exception as e:
-        logger.error(f"Error while getting wanted movies: {e}")
+    except Exception:
+        logger.exception("Error while getting wanted movies:")
+        return None
 
 def is_external_subtitle(sub, video_path) -> bool:
     """Helper to detect if a subtitle is external (not embedded inside the video file)"""
@@ -113,7 +139,7 @@ async def find_base_language_subtitles_from_missing_sutitles(base_url, api_key, 
     for video in videos:
         video_id = video.sonarr_episode_id if isinstance(video, Serie) else video.radarr_id
         for missing_sub in video.missing_subtitles:
-            if missing_sub.code2 in to_languges:
+            if missing_sub.code2 in to_languages:
                 video_id_language_map[video_id] = missing_sub.code2
 
     if not video_id_language_map:
@@ -134,7 +160,11 @@ async def find_base_language_subtitles_from_missing_sutitles(base_url, api_key, 
     items_to_search = []
 
     for video_id, language in video_id_language_map.items():
-        video = video_id_to_video_map[video_id]
+        # Handle cases where the metadata chunking missed a video somehow
+        video = video_id_to_video_map.get(video_id)
+        if not video:
+            continue
+
         if video.subtitles is None:
             video.subtitles = []
 
@@ -183,8 +213,8 @@ def translation_worker(worker_id, base_url, api_key):
                 response.raise_for_status()
                 logger.info(f"[Translate Worker: {worker_id}] Translation finished")
 
-            except Exception as e:
-                logger.error(f"[Translate Worker: {worker_id}] Error: {e}")
+            except Exception:
+                logger.exception(f"[Translate Worker: {worker_id}] Error in translation:")
             finally:
                 if sub: task_queue.done(sub)
 
@@ -260,8 +290,8 @@ def search_worker(worker_id, base_url, api_key):
                 
                 logger.info(f"[Search Worker: {worker_id}] Successfully triggered {best_sub['provider']} for ID: {video_id}")
 
-            except Exception as e:
-                logger.error(f"[Search Worker: {worker_id}] Error in provider search/download: {e}")
+            except Exception:
+                logger.exception(f"[Search Worker: {worker_id}] Error in provider search/download:")
             finally:
                 if item: search_task_queue.done(item)
 
@@ -296,8 +326,8 @@ async def main(base_url, api_key):
         try:
             if series_scan: await scan_and_process(base_url, api_key, "episodes")
             if movies_scan: await scan_and_process(base_url, api_key, "movies")
-        except Exception as e:
-            logger.error(f"Uncaught exception: {e}")
+        except Exception:
+            logger.exception("Uncaught exception:")
         
         await asyncio.sleep(interval_between_scans)
 
@@ -313,13 +343,12 @@ if __name__ == "__main__":
         print("BAZARR_BASE_URL or BAZARR_API_KEY missing")
         sys.exit(1)
 
-    # 1. Setup File Logging
     os.makedirs(log_directory, exist_ok=True)
     file_handler = TimedRotatingFileHandler(os.path.join(log_directory, "bazarr_lingarr_autotranslate.log"), when="midnight", interval=1, backupCount=4)
     file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
     logger.addHandler(file_handler)
 
-    # 2. Setup Console Logging (FOR DOCKER)
+    # Added console handler back in so logs output directly in Docker
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
     logger.addHandler(console_handler)
