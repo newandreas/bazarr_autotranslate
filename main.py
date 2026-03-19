@@ -242,6 +242,8 @@ async def find_base_language_subtitles_from_missing_sutitles(base_url, api_key, 
         external_base_subs = [sub for sub in base_subs if is_external_subtitle(sub, getattr(video, 'path', None))]
 
         if external_base_subs:
+            external_base_subs.sort(key=lambda x: base_languages.index(x.code2))
+            
             if not task_queue.check({"is_serie": isinstance(video, Serie), "video_id": video_id, "to_language": language}):
                 subtitles_to_translate.append(SubtitleTranslate(external_base_subs[0], language, video_id, isinstance(video, Serie)))
         else:
@@ -349,7 +351,11 @@ def search_worker(worker_id, base_url, api_key):
                     logger.info(f"[Search Worker: {worker_id}] No embedded or Whisper candidates found for ID: {video_id}")
                     continue
                     
-                candidates.sort(key=lambda c: 0 if c.get("provider") == "embeddedsubtitles" else 1)
+                # PRIORITIZE: Provider first (Embedded > Whisper), then by BASE_LANGUAGES order
+                candidates.sort(key=lambda c: (
+                    0 if c.get("provider") == "embeddedsubtitles" else 1,
+                    base_languages.index(c.get("language"))
+                ))
                 best_sub = candidates[0]
                 
                 logger.info(f"[Search Worker: {worker_id}] Found {best_sub['provider']} candidate. Triggering download/extraction...")
