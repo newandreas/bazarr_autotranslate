@@ -1,8 +1,8 @@
-# 🎬 Bazarr Auto-Translate
+# 🎬 Bazarr Auto-Translate & Acquire
 
-A lightweight Python automation script that interfaces with the Bazarr API to automatically detect missing subtitles and generate them by translating existing subtitles in your library. 
+A lightweight Python automation script that interfaces with the Bazarr API to intelligently acquire, extract, transcribe, and translate missing subtitles in your library. 
 
-Currently, Bazarr supports subtitle translation via providers like Lingarr, but it lacks a built-in automation queue to translate subtitles seamlessly in the background. This script bridges that gap by continuously scanning your media, finding available subtitles, and queuing them for translation directly through Bazarr's native request system.
+Currently, Bazarr supports powerful tools like Lingarr (translation), WhisperAI (audio transcription), and Embedded Subtitle extraction. However, it lacks a unified, intelligent background queue to manage them together. This script bridges that gap by continuously scanning your media and running a multi-stage pipeline to get the best possible subtitle without downloading out-of-sync garbage.
 
 > [!CAUTION]
 > This fork was modified with the help of LLMs, I am not a professional coder.
@@ -11,9 +11,9 @@ Currently, Bazarr supports subtitle translation via providers like Lingarr, but 
 
 ## ⚠️ Critical Warning
 
-This script is designed to run automatically and continuously. Depending on the size of your library and your configuration, it can trigger **a massive volume of translation requests**.
+This script is designed to run automatically and continuously. Depending on the size of your library and your configuration, it can trigger **a massive volume of API requests, transcriptions, and translations**.
 
-If you use a **paid translation API service**, this script could result in **unexpected high charges** because it currently has:
+If you use a **paid translation API service** (like Lingarr + DeepL), this script could result in **unexpected high charges** because it currently has:
 - No maximum daily translation caps.
 - No rate limiting.
 - No limits on consecutive errors.
@@ -22,22 +22,36 @@ If you use a **paid translation API service**, this script could result in **une
 
 ---
 
-## ✨ Key Features
+## ✨ Key Features & The Multi-Stage Pipeline
 
-- **Automated Scanning**: Periodically scans your mapped Movies and TV Series libraries in Bazarr for missing subtitles.
-- **Intelligent Fallback**: Checks if an existing subtitle in your library (e.g., English) can be used as a base source to translate into your desired missing languages.
-- **Native Integration**: Pushes translation requests securely through the Bazarr API. This ensures Bazarr properly tracks the new subtitle and allows for future quality upgrades.
-- **Concurrency**: Supports multiple worker threads to process multiple translation requests in parallel.
+Instead of blindly translating everything, the script uses a smart fallback engine to save compute resources and guarantee better subtitle quality. When a subtitle is missing, it evaluates options in this exact order:
+
+1. **Direct Acquisition**: Is there an *embedded* subtitle or a *high-scoring* online subtitle (≥ `MIN_SCORE`) for the target language? If yes, extract/download it immediately. No translation needed!
+2. **Local Translation**: Do we already have an external base subtitle (e.g., English) on disk? If yes, queue it for Lingarr translation.
+3. **Base Acquisition**: Is there an *embedded* base subtitle or a *high-scoring* online base subtitle? If yes, extract/download it to be translated on the next scan.
+4. **WhisperAI Fallback**: If absolutely no high-quality subtitles are available online, trigger WhisperAI to transcribe the audio track into a base subtitle.
+5. **Profile Migration (Optional)**: Automatically changes a media item's Bazarr Language Profile if specific languages are missing (e.g., automatically shifting `EN+NO` to `EN+NB`).
 
 ---
 
-## 🤔 Why use this instead of standalone Lingarr?
+## 🤔 Why use this instead of standalone Lingarr or Whisper?
 
-While Lingarr can auto-translate subtitles externally, translating subtitles *outside* of Bazarr causes a desync: Bazarr remains unaware of the new subtitle's existence. Consequently, Bazarr will never attempt to upgrade it if a better, manually-crafted subtitle drops on your indexers later.
+While Lingarr and Whisper can generate subtitles externally, doing so *outside* of Bazarr causes a desync: Bazarr remains unaware of the new subtitle's existence. Consequently, Bazarr will never attempt to upgrade it if a better, manually-crafted subtitle drops on your indexers later.
 
-By using this script, translations are strictly routed through **Bazarr’s API**. This guarantees that:
-1. Bazarr accurately registers the new translation in its database.
-2. Bazarr can flag the subtitle as "Upgradable" and replace it when a native version becomes available.
+By using this script, all actions are strictly routed through **Bazarr’s API**. This guarantees that:
+1. Bazarr accurately registers the new extraction, transcription, or translation in its database.
+2. Bazarr can flag the subtitle as "Upgradable" and replace it when a native retail version becomes available.
+
+---
+
+## 💡 Use Case: The "English-Only" WhisperAI Trick
+
+**Can I use this if I ONLY want English subtitles?** **Yes! In fact, it solves one of Bazarr's biggest WhisperAI flaws.**
+
+If you want Bazarr to download good online subtitles (e.g., 86%+ score) but fallback to WhisperAI when none exist, you normally have a problem: Bazarr assigns WhisperAI a fixed score of `~66%`. If you lower your Bazarr cutoff to 66% to allow WhisperAI to run, Bazarr will start downloading terrible, out-of-sync online subtitles too!
+
+**The Solution:** Leave your Bazarr minimum score high (e.g., 86%). Run this script with `BASE_LANGUAGES=en` and `TO_LANGUAGES=en`. 
+The script will enforce your strict `MIN_SCORE=86` for online providers, but it is programmed to **bypass the score requirement for WhisperAI and Embedded tracks**. You get high-quality online subs when available, and WhisperAI when they aren't, completely avoiding the 66% garbage tier!
 
 ---
 
@@ -49,11 +63,14 @@ The script is controlled via environment variables. You can pass these through a
 | :--- | :--- | :--- | :--- |
 | `BAZARR_BASE_URL` | The full URL to your Bazarr instance (e.g., `http://192.168.1.50:6767`). | None | **Yes** |
 | `BAZARR_API_KEY` | Your Bazarr API Key (found in Settings > General). | None | **Yes** |
-| `BASE_LANGUAGES` | Comma-separated ISO-639-1 (`code2`) languages to use as the *source* for translations (e.g., `en,fr`). | None | **Yes** |
-| `TO_LANGUAGES` | Comma-separated ISO-639-1 (`code2`) languages you want the missing subtitles translated *into* (e.g., `es,de`). | None | **Yes** |
-| `TRANSLATION_REQUEST_TIMEOUT` | Seconds to wait for a translation to finish before marking it as failed. **Note:** Set this high enough to prevent duplicate requests. | `900` (15m) | No |
-| `NUM_WORKERS` | Number of simultaneous translation threads to process at once. | `1` | No |
+| `BASE_LANGUAGES` | Comma-separated ISO-639-1 (`code2`) languages to use as the *source* (e.g., `en,fr`). **Prioritized in the order listed.** | None | **Yes** |
+| `TO_LANGUAGES` | Comma-separated ISO-639-1 (`code2`) languages you want missing subtitles translated *into* (e.g., `es,de`). | None | **Yes** |
+| `MIN_SCORE` | The minimum Bazarr score required to download an online subtitle. (Embedded & Whisper bypass this). | `86` | No |
+| `TRANSLATION_REQUEST_TIMEOUT` | Seconds to wait for a translation to finish before marking it as failed. | `900` (15m) | No |
+| `NUM_WORKERS` | Number of simultaneous translation/search threads to process at once. | `1` | No |
 | `INTERVAL_BETWEEN_SCANS` | Cooldown time (in seconds) between full library scans. | `300` (5m) | No |
+| `SOURCE_PROFILE_ID` | The Bazarr Profile ID to target for automatic migration. | None | No |
+| `TARGET_PROFILE_ID` | The Bazarr Profile ID to switch the media to during migration. | None | No |
 | `SERIES_SCAN` / `MOVIES_SCAN` | Toggle scanning for Shows/Movies respectively (`true` or `false`). | `true` | No |
 | `LOG_LEVEL` / `LOG_DIRECTORY` | Logging verbosity (`DEBUG`, `INFO`, `ERROR`) and the output path. | `INFO` / `logs/`| No |
 
@@ -75,18 +92,7 @@ services:
       - BAZARR_API_KEY=your_api_key_here
       - BASE_LANGUAGES=en
       - TO_LANGUAGES=es,fr
+      - MIN_SCORE=86
       - LOG_LEVEL=info
     volumes:
       - ./logs:/usr/src/app/logs
-```
-
-### Bazarr Settings Prerequisites
-To ensure everything operates smoothly, verify the following settings inside Bazarr:
-1. **Enable a Translator**: Navigate to `Settings -> Subtitles -> Translating` and ensure a provider (like Lingarr) is selected and configured.
-2. **Enable Upgrades**: Navigate to `Settings -> Subtitles -> Upgrading Subtitles` and enable `Upgrade Manually Downloaded or Translated Subtitles`. This allows Bazarr to eventually replace the machine translations with real ones.
-
----
-
-## 🤝 Contributing & License
-Contributions, issue reports, and pull requests are highly welcome. 
-Distributed under the **MIT License**.
