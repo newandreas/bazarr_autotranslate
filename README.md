@@ -84,7 +84,7 @@ The easiest way to run the script is alongside your existing media stack using D
 ```yaml
 services:
   bazarr-autotranslate:
-    image: ghcr.io/zelak312/bazarr_autotranslate:latest
+    image: ghcr.io/newandreas/bazarr_autotranslate:latest
     container_name: bazarr_autotranslate
     restart: unless-stopped
     environment:
