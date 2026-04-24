@@ -2,7 +2,6 @@ import os
 import sys
 import time
 import httpx
-import queue
 import signal
 import asyncio
 import logging
@@ -36,6 +35,7 @@ to_languages = [lang.strip() for lang in to_languages_env.split(",")] if to_lang
 translation_request_timeout = int(get_env_or_default("TRANSLATION_REQUEST_TIMEOUT", 15 * 60))
 num_workers = int(get_env_or_default("NUM_WORKERS", 1))
 interval_between_scans = int(get_env_or_default("INTERVAL_BETWEEN_SCANS", 5 * 60))
+min_score = int(get_env_or_default("MIN_SCORE", 86))
 log_level = get_env_or_default("LOG_LEVEL", "INFO")
 log_directory = get_env_or_default("LOG_DIRECTORY", "logs/")
 series_scan = bool(get_env_or_default("SERIES_SCAN", True))
@@ -50,7 +50,7 @@ if target_profile_id: target_profile_id = int(target_profile_id)
 action_cooldown_cache = {}
 ACTION_COOLDOWN_SECONDS = 3600
 
-key_fn = lambda x: f" {"s" if get_attr_or_key(x, "is_serie") else "m"} {get_attr_or_key(x, "video_id")}_{get_attr_or_key(x, "to_language")}"
+key_fn = lambda x: f" {'s' if get_attr_or_key(x, 'is_serie') else 'm'} {get_attr_or_key(x, 'video_id')}_{get_attr_or_key(x, 'to_language')}"
 search_key_fn = lambda x: f"search_{'s' if get_attr_or_key(x, 'is_serie') else 'm'}_{get_attr_or_key(x, 'video_id')}"
 migration_key_fn = lambda x: f"mig_{x['type']}_{x['mig_id']}"
 
@@ -59,6 +59,7 @@ search_task_queue = UniqueQueue(key_fn=search_key_fn)
 migration_queue = UniqueQueue(key_fn=migration_key_fn)
 shutdown_event = asyncio.Event()
 logger = logging.getLogger("bazarr_lingarr")
+
 
 async def process_profile_migrations(base_url, api_key, media_type):
     """Independently checks for media missing 'no' and migrates their profile to 'nb'"""
@@ -80,7 +81,6 @@ async def process_profile_migrations(base_url, api_key, media_type):
     candidates = []
     for obj in wanted_data:
         missing = obj.get("missing_subtitles", [])
-        # Only check items specifically missing "no"
         if any(isinstance(sub, dict) and sub.get("code2") == "no" for sub in missing):
             vid_id = obj.get("radarrId") if media_type == "movies" else obj.get("sonarrEpisodeId")
             series_id = obj.get("sonarrSeriesId") if media_type == "episodes" else None
@@ -90,7 +90,6 @@ async def process_profile_migrations(base_url, api_key, media_type):
     if not candidates:
         return
         
-    # Fetch full metadata to check the actual profile ID
     meta_endpoint = f"{base_url}/api/{media_type}"
     async with httpx.AsyncClient() as client:
         chunk_size = 50
@@ -109,7 +108,6 @@ async def process_profile_migrations(base_url, api_key, media_type):
                         v_id = raw_item.get("radarrId") if media_type == "movies" else raw_item.get("sonarrEpisodeId")
                         c = next((x for x in chunk if x["vid_id"] == v_id), None)
                         if c:
-                            # Apply to the Movie directly, or the parent Series for episodes
                             mig_id = v_id if media_type == "movies" else c["series_id"]
                             if media_type == "episodes" and not mig_id:
                                 mig_id = raw_item.get("sonarrSeriesId") or raw_item.get("seriesId")
@@ -142,7 +140,6 @@ async def get_episodes_metadata(base_url: str, api_key: str, episode_ids: Option
                 response = await client.get(endpoint, headers=headers, params=params)
                 response.raise_for_status()
                 all_episodes.extend([Serie.from_dict(obj) for obj in response.json()["data"]])
-                
             return all_episodes
     except Exception:
         logger.exception("Error while getting episode metadata:")
@@ -178,7 +175,6 @@ async def get_movies_metadata(base_url: str, api_key: str, movie_ids: Optional[L
                 response = await client.get(endpoint, headers=headers, params=params)
                 response.raise_for_status()
                 all_movies.extend([Movie.from_dict(obj) for obj in response.json()["data"]])
-                
             return all_movies
     except Exception:
         logger.exception("Error while getting movies metadata:")
@@ -205,16 +201,19 @@ def is_external_subtitle(sub, video_path) -> bool:
         return True
     return False
 
-async def find_base_language_subtitles_from_missing_sutitles(base_url, api_key, videos: List[Serie] | List[Movie]):
+async def find_subtitles_to_process(base_url, api_key, videos: List[Serie] | List[Movie]):
     video_id_language_map = {}
     for video in videos:
         video_id = video.sonarr_episode_id if isinstance(video, Serie) else video.radarr_id
+        missing_langs = []
         for missing_sub in video.missing_subtitles:
             if missing_sub.code2 in to_languages:
-                video_id_language_map[video_id] = missing_sub.code2
+                missing_langs.append(missing_sub.code2)
+        if missing_langs:
+            video_id_language_map[video_id] = missing_langs
 
     if not video_id_language_map:
-        return [], []
+        return []
 
     metadata = None
     if isinstance(videos[0], Serie):
@@ -223,14 +222,13 @@ async def find_base_language_subtitles_from_missing_sutitles(base_url, api_key, 
         metadata = await get_movies_metadata(base_url, api_key, movie_ids=list(video_id_language_map.keys()))
 
     if not metadata:
-        return [], []
+        return []
     
     video_id_to_video_map = { (v.sonarr_episode_id if isinstance(v, Serie) else v.radarr_id): v for v in metadata }
     
-    subtitles_to_translate = []
-    items_to_search = []
+    items_to_process = []
 
-    for video_id, language in video_id_language_map.items():
+    for video_id, missing_langs in video_id_language_map.items():
         video = video_id_to_video_map.get(video_id)
         if not video:
             continue
@@ -243,20 +241,20 @@ async def find_base_language_subtitles_from_missing_sutitles(base_url, api_key, 
 
         if external_base_subs:
             external_base_subs.sort(key=lambda x: base_languages.index(x.code2))
-            
-            if not task_queue.check({"is_serie": isinstance(video, Serie), "video_id": video_id, "to_language": language}):
-                subtitles_to_translate.append(SubtitleTranslate(external_base_subs[0], language, video_id, isinstance(video, Serie)))
-        else:
-            series_id = getattr(video, 'sonarr_series_id', None) or getattr(video, 'series_id', None) if isinstance(video, Serie) else None
-            
-            if not search_task_queue.check({"is_serie": isinstance(video, Serie), "video_id": video_id}):
-                items_to_search.append({
-                    "video_id": video_id, 
-                    "is_serie": isinstance(video, Serie),
-                    "series_id": series_id
-                })
 
-    return subtitles_to_translate, items_to_search
+        series_id = getattr(video, 'sonarr_series_id', None) or getattr(video, 'series_id', None) if isinstance(video, Serie) else None
+        
+        if not search_task_queue.check({"is_serie": isinstance(video, Serie), "video_id": video_id}):
+            items_to_process.append({
+                "video_id": video_id, 
+                "is_serie": isinstance(video, Serie),
+                "series_id": series_id,
+                "missing_languages": missing_langs,
+                "external_base_sub": external_base_subs[0] if external_base_subs else None
+            })
+
+    return items_to_process
+
 
 def migration_worker(worker_id, base_url, api_key):
     headers = {"X-API-KEY": api_key}
@@ -269,7 +267,6 @@ def migration_worker(worker_id, base_url, api_key):
                 mig_id = item["mig_id"]
                 target_profile = item["target_profile"]
                 
-                # API expects POST with radarrid and profileid parameters
                 if media_type == "movies":
                     endpoint = f"{base_url}/api/movies"
                     params = {"radarrid": mig_id, "profileid": target_profile}
@@ -278,7 +275,6 @@ def migration_worker(worker_id, base_url, api_key):
                     params = {"seriesid": mig_id, "profileid": target_profile}
                     
                 logger.info(f"[Migration Worker: {worker_id}] Changing profile for {media_type} ID {mig_id} to Profile {target_profile}")
-                
                 response = client.post(endpoint, headers=headers, params=params)
                 response.raise_for_status()
                 logger.info(f"[Migration Worker: {worker_id}] Profile changed successfully!")
@@ -327,6 +323,8 @@ def search_worker(worker_id, base_url, api_key):
                 is_serie = item["is_serie"]
                 video_id = item["video_id"]
                 series_id = item.get("series_id")
+                missing_languages = item.get("missing_languages", [])
+                external_base_sub = item.get("external_base_sub")
                 
                 logger.info(f"[Search Worker: {worker_id}] Querying Providers for {'Episode' if is_serie else 'Movie'} ID: {video_id}")
                 
@@ -341,52 +339,84 @@ def search_worker(worker_id, base_url, api_key):
                 get_response.raise_for_status()
                 data = get_response.json().get("data", [])
                 
-                # Accurately mapping to embeddedsubtitles based on your API response
-                candidates = [
-                    c for c in data 
-                    if c.get("language") in base_languages and c.get("provider") in ["embeddedsubtitles", "whisperai"]
-                ]
-                
-                if not candidates:
-                    logger.info(f"[Search Worker: {worker_id}] No embedded or Whisper candidates found for ID: {video_id}")
-                    continue
-                    
-                # PRIORITIZE: Provider first (Embedded > Whisper), then by BASE_LANGUAGES order
-                candidates.sort(key=lambda c: (
-                    0 if c.get("provider") == "embeddedsubtitles" else 1,
-                    base_languages.index(c.get("language"))
-                ))
-                best_sub = candidates[0]
-                
-                logger.info(f"[Search Worker: {worker_id}] Found {best_sub['provider']} candidate. Triggering download/extraction...")
-                
-                if is_serie:
-                    post_endpoint = f"{base_url}/api/providers/episodes"
-                    post_params = {
-                        "seriesid": series_id,
-                        "episodeid": video_id,
-                    }
-                else:
-                    post_endpoint = f"{base_url}/api/providers/movies"
-                    post_params = {
-                        "radarrid": video_id,
-                    }
-                    
-                hi_flag = "true" if str(best_sub.get("hearing_impaired", "False")).lower() == "true" else "false"
-                forced_flag = "true" if str(best_sub.get("forced", "False")).lower() == "true" else "false"
+                def trigger_download(sub_candidate):
+                    hi_flag = "true" if str(sub_candidate.get("hearing_impaired", "False")).lower() == "true" else "false"
+                    forced_flag = "true" if str(sub_candidate.get("forced", "False")).lower() == "true" else "false"
 
-                post_params.update({
-                    "hi": hi_flag,
-                    "forced": forced_flag,
-                    "original_format": "true",
-                    "provider": best_sub.get("provider"),
-                    "subtitle": best_sub.get("subtitle")
-                })
+                    post_params = {
+                        "hi": hi_flag,
+                        "forced": forced_flag,
+                        "original_format": "true",
+                        "provider": sub_candidate.get("provider"),
+                        "subtitle": sub_candidate.get("subtitle")
+                    }
 
-                post_response = client.post(post_endpoint, headers=headers, params=post_params)
-                post_response.raise_for_status()
-                
-                logger.info(f"[Search Worker: {worker_id}] Successfully triggered {best_sub['provider']} for ID: {video_id}")
+                    if is_serie:
+                        post_endpoint = f"{base_url}/api/providers/episodes"
+                        post_params.update({"seriesid": series_id, "episodeid": video_id})
+                    else:
+                        post_endpoint = f"{base_url}/api/providers/movies"
+                        post_params.update({"radarrid": video_id})
+
+                    post_response = client.post(post_endpoint, headers=headers, params=post_params)
+                    post_response.raise_for_status()
+                    logger.info(f"[Search Worker: {worker_id}] Successfully triggered {sub_candidate['provider']} for ID: {video_id}")
+
+                for target_lang in missing_languages:
+                    # 1. Look for good Target Language candidates first (so we can avoid translation entirely)
+                    target_candidates = [
+                        c for c in data 
+                        if c.get("language") == target_lang and (
+                            c.get("provider") == "embeddedsubtitles" or c.get("score", 0) >= min_score
+                        )
+                    ]
+                    
+                    if target_candidates:
+                        target_candidates.sort(key=lambda c: (0 if c.get("provider") == "embeddedsubtitles" else 1, -c.get("score", 0)))
+                        best_target = target_candidates[0]
+                        logger.info(f"[Search Worker: {worker_id}] Found valid {best_target['provider']} candidate for {target_lang} (Score: {best_target.get('score', 0)}). Triggering direct download...")
+                        trigger_download(best_target)
+                        continue
+                        
+                    # 2. If no target candidate, check if we already have an external base sub downloaded to translate
+                    if external_base_sub:
+                        sub_trans = SubtitleTranslate(external_base_sub, target_lang, video_id, is_serie)
+                        if not task_queue.check(sub_trans):
+                            cache_key = f"trans_{video_id}_{target_lang}"
+                            current_time = time.time()
+                            if current_time - action_cooldown_cache.get(cache_key, 0) > ACTION_COOLDOWN_SECONDS:
+                                action_cooldown_cache[cache_key] = current_time
+                                task_queue.put(sub_trans)
+                                logger.info(f"[Search Worker: {worker_id}] Queued Translate: {external_base_sub.path} -> {target_lang}")
+                        continue
+                        
+                    # 3. If no external base sub, check for valid Base Language candidates to extract/download/whisper
+                    base_candidates = [
+                        c for c in data 
+                        if c.get("language") in base_languages and (
+                            c.get("provider") in ["embeddedsubtitles", "whisperai"] or c.get("score", 0) >= min_score
+                        )
+                    ]
+                    
+                    if base_candidates:
+                        def base_sort_key(c):
+                            prov = c.get("provider")
+                            prov_priority = 0 if prov == "embeddedsubtitles" else 2 if prov == "whisperai" else 1
+                            lang_priority = base_languages.index(c.get("language")) if c.get("language") in base_languages else 99
+                            score_priority = -c.get("score", 0)
+                            return (prov_priority, lang_priority, score_priority)
+
+                        base_candidates.sort(key=base_sort_key)
+                        best_base = base_candidates[0]
+                        
+                        cache_key = f"base_dl_{video_id}_{best_base['provider']}"
+                        current_time = time.time()
+                        if current_time - action_cooldown_cache.get(cache_key, 0) > ACTION_COOLDOWN_SECONDS:
+                            action_cooldown_cache[cache_key] = current_time
+                            logger.info(f"[Search Worker: {worker_id}] Found valid {best_base['provider']} base candidate for {best_base.get('language')} (Score: {best_base.get('score', 0)}). Triggering...")
+                            trigger_download(best_base)
+                    else:
+                        logger.info(f"[Search Worker: {worker_id}] No valid base or target candidates found for ID: {video_id} (Target: {target_lang})")
 
             except Exception:
                 logger.exception(f"[Search Worker: {worker_id}] Error in provider search/download:")
@@ -396,10 +426,9 @@ def search_worker(worker_id, base_url, api_key):
 async def scan_and_process(base_url, api_key, media_type="episodes"):
     logger.info(f"Scanning for {media_type}")
     
-    # 1. Run profile migrations separately
+    # Run profile migrations separately
     await process_profile_migrations(base_url, api_key, media_type)
     
-    # 2. Run subtitle extraction/translation
     if media_type == "episodes":
         items = await get_wanted_episodes(base_url, api_key)
     else:
@@ -409,23 +438,15 @@ async def scan_and_process(base_url, api_key, media_type="episodes"):
         logger.info(f"Found no missing subtitles for {media_type}")
         return
     
-    subs_to_translate, items_to_search = await find_base_language_subtitles_from_missing_sutitles(base_url, api_key, items)
+    items_to_process = await find_subtitles_to_process(base_url, api_key, items)
     
     current_time = time.time()
-    
-    for sub in subs_to_translate:
-        cache_key = f"trans_{sub.video_id}"
-        if current_time - action_cooldown_cache.get(cache_key, 0) > ACTION_COOLDOWN_SECONDS:
-            action_cooldown_cache[cache_key] = current_time
-            task_queue.put(sub)
-            logger.info(f"Queued Translate: {sub.base_subtitle.path} -> {sub.to_language}")
-
-    for item in items_to_search:
+    for item in items_to_process:
         cache_key = f"search_{item['video_id']}"
         if current_time - action_cooldown_cache.get(cache_key, 0) > ACTION_COOLDOWN_SECONDS:
             action_cooldown_cache[cache_key] = current_time
             search_task_queue.put(item)
-            logger.info(f"Queued Extract/Whisper check: {'Episode' if item['is_serie'] else 'Movie'} ID {item['video_id']}")
+            logger.info(f"Queued Provider Search for {'Episode' if item['is_serie'] else 'Movie'} ID {item['video_id']}")
 
 async def main(base_url, api_key):
     for i in range(num_workers):
