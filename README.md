@@ -1,150 +1,92 @@
-# Bazarr Subtitle Translation Automation Script
+# 🎬 Bazarr Auto-Translate
 
-A Python script that automates subtitle translation in Bazarr by leveraging its API. The script identifies missing subtitles for movies and series, checks if existing subtitles can be translated into the missing language, and queues translation requests automatically.
+A lightweight Python automation script that interfaces with the Bazarr API to automatically detect missing subtitles and generate them by translating existing subtitles in your library. 
 
-> ⚠️ **Critical Warning**
->
-> This script can trigger **a high volume of subtitle translations** automatically depending on the settings.  
-> If your Bazarr instance is linked to a **paid translation service**, this could lead to **unexpected charges** due to:
->
-> - No error limits
-> - No rate limiting
-> - No maximum translation cap
->
-> ⚠️ **Use at your own risk**. You are responsible for monitoring and controlling usage.  
-> I am planning on adding limits to make it safer but for now there are NONE
+Currently, Bazarr supports subtitle translation via providers like Lingarr, but it lacks a built-in automation queue to translate subtitles seamlessly in the background. This script bridges that gap by continuously scanning your media, finding available subtitles, and queuing them for translation directly through Bazarr's native request system.
+
+> [!CAUTION]
+> This fork was modified with the help of LLMs, I am not a professional coder.
 
 ---
 
-## Features
+## ⚠️ Critical Warning
 
-- Automatically scans movies and series for missing subtitles.
-- Checks if existing subtitles can be translated into the missing language.
-- Queues translation requests using Bazarr API.
-- Configurable scanning intervals and worker concurrency.
-- Logs actions and errors for easier monitoring.
+This script is designed to run automatically and continuously. Depending on the size of your library and your configuration, it can trigger **a massive volume of translation requests**.
 
----
+If you use a **paid translation API service**, this script could result in **unexpected high charges** because it currently has:
+- No maximum daily translation caps.
+- No rate limiting.
+- No limits on consecutive errors.
 
-## Why?
-
-Bazarr supports subtitle translation via Lingarr, and Lingarr can perform automatic subtitle translations. However, when subtitles are translated directly through Lingarr (outside of Bazarr’s request system), **Bazarr is unaware of those translations**. As a result:
-
-- Bazarr does not register the translated subtitles in its internal state.
-- Bazarr will never attempt to **upgrade** or **replace** the translated subtitles with higher-quality versions from its indexers.
-
-This script was created to address that gap. It automates the process of requesting translations **through Bazarr’s API**, so:
-
-- Bazarr tracks the translations.
-- Upgrades to translated subtitles are possible [(if the proper setting is set, see section)](#translated-subtitle-upgrade).
-- Everything integrates smoothly with Bazarr’s native behavior.
-
-Since Bazarr currently has **no automation features** for translation (the process is fully manual), this script bridges that functionality gap by making translation automatic and trackable.
-
-
-## Configuration
-
-The script is configured via environment variables using a `.env` file in the same directory. Below is a list of supported variables with their descriptions and default values:
-
-[Docker compose example](#docker-compose-example)
-
-| Variable                      | Description                                                                                       | Default         |
-|-------------------------------|---------------------------------------------------------------------------------------------------|-----------------|
-| `BAZARR_BASE_URL`             | The full base URL of your Bazarr instance (e.g., `http://localhost:6767`).                       | **Required**    |
-| `BAZARR_API_KEY`              | Your Bazarr API key. This is required to authenticate API calls.                                 | **Required**    |
-| `BASE_LANGUAGES`              | Comma-separated list of subtitle languages to use as source for translation in code2 (e.g., `en,fr`).     | required |
-| `TO_LANGUAGES`                | Comma-separated list of subtitle languages that should be present or translated to also in code2 (e.g., `en,fr`).              | required |
-| `TRANSLATION_REQUEST_TIMEOUT`| Time (in seconds) to wait for the translation to complete or consider it failed (SEE NOTE 2)                    | 900 (15 minutes) |
-| `NUM_WORKERS`                 | Number of worker threads to handle translation queue requests in parallel. That means, How many translation could be processing at the same time                      | 1               |
-| `INTERVAL_BETWEEN_SCANS`     | Interval (in seconds) between each automatic scan of your Bazarr library.                        | 300 (5 minutes) |
-| `LOG_LEVEL`                   | Logging level. Options: `DEBUG`, `INFO`, `ERROR`.                                     | INFO            |
-| `LOG_DIRECTORY`              | Directory where logs will be saved. Will be created if it doesn't exist.                         | `logs/`         |
-| `SERIES_SCAN`                 | Whether to scan TV series for missing subtitles (`true` or `false`).                             | true            |
-| `MOVIES_SCAN`                 | Whether to scan movies for missing subtitles (`true` or `false`).                                | true            |
+**Use this script entirely at your own risk.** Please monitor your usage closely, especially when spinning it up for the first time.
 
 ---
 
-> **Note 1:**  
-> You must provide both `BAZARR_BASE_URL` and `BAZARR_API_KEY` for the script to interact with your Bazarr server.
+## ✨ Key Features
 
-> ⚠️ **IMPORTANT TO NOT HAVE DUPLICATED TRANSLATION REQUEST**.
->
-> **Note 2:**  
-> The `TRANSLATION_REQUEST_TIMEOUT` value **must be set to at least the longest time** it typically takes to complete a subtitle translation. If set too low, the script might queue duplicate translation requests for subtitles already in translation.
-
-> **Note 3:**  
-> `BASE_LANGUAGES` determines which subtitle languages can be used as source material for translation.  
-> `TO_LANGUAGES` sets the target subtitle languages you want to ensure are available. The script will attempt to translate from any available `BASE_LANGUAGES` to any missing `TO_LANGUAGES`.
-> Base languages can be repeated in to languages and vise versa.
-
-> **Note 4:**
-> If you want lingarr to do the translation check the [Lingarr section](#lingarr)
-
-## Usage
-
-1. Set the desired environment variables or use the defaults.  
-2. Run the script by executing:
-3. The script will periodically scan Bazarr via API, detect missing subtitles, and queue translation tasks as needed.
+- **Automated Scanning**: Periodically scans your mapped Movies and TV Series libraries in Bazarr for missing subtitles.
+- **Intelligent Fallback**: Checks if an existing subtitle in your library (e.g., English) can be used as a base source to translate into your desired missing languages.
+- **Native Integration**: Pushes translation requests securely through the Bazarr API. This ensures Bazarr properly tracks the new subtitle and allows for future quality upgrades.
+- **Concurrency**: Supports multiple worker threads to process multiple translation requests in parallel.
 
 ---
 
-## How it Works
+## 🤔 Why use this instead of standalone Lingarr?
 
-1. **Scan**: The script calls Bazarr API to get the current list of movies and series.  
-2. **Check Subtitles**: For each item, it checks which subtitle languages are missing.  
-3. **Find Existing Subtitles**: If a subtitle in another language exists, it requests translation of that subtitle into the missing language via Bazarr API.  
-4. **Queue Translation**: Translation requests are queued and processed by Bazarr automatically.
+While Lingarr can auto-translate subtitles externally, translating subtitles *outside* of Bazarr causes a desync: Bazarr remains unaware of the new subtitle's existence. Consequently, Bazarr will never attempt to upgrade it if a better, manually-crafted subtitle drops on your indexers later.
 
----
-
-## Logging
-
-Logs are saved to the directory specified by `LOG_DIRECTORY` with the log level set by `LOG_LEVEL`. This helps monitor script actions and troubleshoot issues.
+By using this script, translations are strictly routed through **Bazarr’s API**. This guarantees that:
+1. Bazarr accurately registers the new translation in its database.
+2. Bazarr can flag the subtitle as "Upgradable" and replace it when a native version becomes available.
 
 ---
 
-## Lingarr
+## ⚙️ Configuration
 
-For lingarr to do the translation, make sure to have lingarr setup correctly in Bazarr's settings as show below (Those setting will change for you but Lingarr has to be selected)
-`Settings -> Subtitles -> Translating`
+The script is controlled via environment variables. You can pass these through a `.env` file or directly via your Docker configuration. 
 
-![Lingarr translation settings in bazarr](assets/lingarr_settings.png)
+| Variable | Description | Default | Required |
+| :--- | :--- | :--- | :--- |
+| `BAZARR_BASE_URL` | The full URL to your Bazarr instance (e.g., `http://192.168.1.50:6767`). | None | **Yes** |
+| `BAZARR_API_KEY` | Your Bazarr API Key (found in Settings > General). | None | **Yes** |
+| `BASE_LANGUAGES` | Comma-separated ISO-639-1 (`code2`) languages to use as the *source* for translations (e.g., `en,fr`). | None | **Yes** |
+| `TO_LANGUAGES` | Comma-separated ISO-639-1 (`code2`) languages you want the missing subtitles translated *into* (e.g., `es,de`). | None | **Yes** |
+| `TRANSLATION_REQUEST_TIMEOUT` | Seconds to wait for a translation to finish before marking it as failed. **Note:** Set this high enough to prevent duplicate requests. | `900` (15m) | No |
+| `NUM_WORKERS` | Number of simultaneous translation threads to process at once. | `1` | No |
+| `INTERVAL_BETWEEN_SCANS` | Cooldown time (in seconds) between full library scans. | `300` (5m) | No |
+| `SERIES_SCAN` / `MOVIES_SCAN` | Toggle scanning for Shows/Movies respectively (`true` or `false`). | `true` | No |
+| `LOG_LEVEL` / `LOG_DIRECTORY` | Logging verbosity (`DEBUG`, `INFO`, `ERROR`) and the output path. | `INFO` / `logs/`| No |
 
-## Translated Subtitle Upgrade
+---
 
-If you want the translated subtitle to be upgraded if bazarr finds subtitle in that languages. You MUST have the upgrade setting on, see below (Those setting may change for you but `Upgrade Manually Downloaded or Translated Subtitles` must be enabled)
-`Settings -> Subtitles -> Upgrading Subtitles`
+## 🚀 Setup & Usage
 
-![Setting for upgrading subtitles](assets/upgrade_subs_settings.png)
+### Docker Compose
+The easiest way to run the script is alongside your existing media stack using Docker Compose:
 
-If setup correctly, in Bazarr's history, translations should have "Upgradable" icon
-
-![Upgradable shown in bazarr's history](assets/bazarr_upgrade.png)
-
-## Docker Compose Example
-
-```yml
+```yaml
 services:
-    test:
-        image: ghcr.io/zelak312/bazarr_autotranslate:latest
-        environment:
-            - BAZARR_BASE_URL=<bazarr_url>
-            - BAZARR_API_KEY=<bazarr_api_key>
-            - BASE_LANGUAGES=<languages>
-            - TO_LANGUAGES=<languages>
-            - LOG_LEVEL=info
-            # any other configuration needed
-        volumes:
-            # if logs are wanted 
-            - ./logs:/usr/src/app/logs
+  bazarr-autotranslate:
+    image: ghcr.io/zelak312/bazarr_autotranslate:latest
+    container_name: bazarr_autotranslate
+    restart: unless-stopped
+    environment:
+      - BAZARR_BASE_URL=http://your_bazarr_ip:6767
+      - BAZARR_API_KEY=your_api_key_here
+      - BASE_LANGUAGES=en
+      - TO_LANGUAGES=es,fr
+      - LOG_LEVEL=info
+    volumes:
+      - ./logs:/usr/src/app/logs
 ```
 
-## Contributing
-
-Feel free to open issues or submit pull requests to improve this tool!
+### Bazarr Settings Prerequisites
+To ensure everything operates smoothly, verify the following settings inside Bazarr:
+1. **Enable a Translator**: Navigate to `Settings -> Subtitles -> Translating` and ensure a provider (like Lingarr) is selected and configured.
+2. **Enable Upgrades**: Navigate to `Settings -> Subtitles -> Upgrading Subtitles` and enable `Upgrade Manually Downloaded or Translated Subtitles`. This allows Bazarr to eventually replace the machine translations with real ones.
 
 ---
 
-## License
-
-MIT License
+## 🤝 Contributing & License
+Contributions, issue reports, and pull requests are highly welcome. 
+Distributed under the **MIT License**.
